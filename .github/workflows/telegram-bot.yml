@@ -4,8 +4,17 @@ on:
   # GitHub cron en sık 5 dakikada bir çalışır
   schedule:
     - cron: '*/5 * * * *'
-  # Manuel tetikleme de mümkün
+  # Manuel tetikleme — istersen bekleyen kuyruğu temizleyebilirsin
   workflow_dispatch:
+    inputs:
+      ack_all:
+        description: 'Bekleyen tüm mesajları İŞLEME ALMADAN temizle (kuyruk sıfırlama)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 # Aynı anda birden fazla çalışma olmasını engelle
 concurrency:
@@ -29,8 +38,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run bot (once)
+      - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           AUTHORIZED_CHAT_IDS: ${{ secrets.AUTHORIZED_CHAT_IDS }}
-        run: python telegram_bist_bot.py --once
+        run: |
+          if [ "${{ inputs.ack_all }}" = "true" ]; then
+            python telegram_bist_bot.py --ack-all
+          else
+            python telegram_bist_bot.py --once
+          fi
