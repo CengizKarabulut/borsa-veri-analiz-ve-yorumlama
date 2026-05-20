@@ -425,14 +425,14 @@ def uyari_mesaji():
 
 
 def markdown_rapor(skor_df, dosya_adi):
-    """İlave dosya olarak gönderilecek tam markdown rapor."""
+    """Geriye dönük: hâlâ MD üretebilir ama PDF tercih edilir."""
     n = len(skor_df)
     md = [f"# BIST Sektör Analiz Raporu",
           f"\n**Kaynak:** `{dosya_adi}`  ",
-          f"**Hisse Sayısı:** {n}  ",
-          "\n## Puanlama Tablosu\n",
-          "| # | Hisse | Toplam | Değ | Kâr | Büy | Bil | F/K | ROE% | FAVÖK% | Borç/ÖzK |",
-          "|---|-------|-------:|----:|----:|----:|----:|----:|-----:|-------:|---------:|"]
+          f"**Hisse Sayısı:** {n}  "]
+    md.append("\n## Puanlama Tablosu\n")
+    md.append("| # | Hisse | Toplam | Değ | Kâr | Büy | Bil | F/K | ROE% | FAVÖK% | Borç/ÖzK |")
+    md.append("|---|-------|-------:|----:|----:|----:|----:|----:|-----:|-------:|---------:|")
     for i, r in skor_df.iterrows():
         md.append(
             f"| {i+1} | **{r['Hisse']}** | {r['TOPLAM SKOR']:.1f} | "
@@ -441,22 +441,11 @@ def markdown_rapor(skor_df, dosya_adi):
             f"{r['F/K']:.1f} | {r['ROE %']:.1f} | "
             f"{r['FAVÖK Marjı %']:.1f} | {r['Borç/Özkaynak']:.2f} |"
         )
-    md.append(f"\n## İlk {min(TOP_N_DETAY, n)} Detay\n")
-    for i, r in skor_df.head(TOP_N_DETAY).iterrows():
-        md.append(f"### {i+1}. {r['Hisse']} — {r['Firma']}")
-        md.append(f"**Skor: {r['TOPLAM SKOR']:.1f}** (D:{r['Değerleme Skoru']:.0f} "
-                  f"K:{r['Karlılık Skoru']:.0f} B:{r['Büyüme Skoru']:.0f} "
-                  f"Bi:{r['Bilanço Skoru']:.0f})")
-        md.append(f"- F/K: {r['F/K']:.1f} | PD/DD: {r['PD/DD']:.1f} | "
-                  f"ROE: %{r['ROE %']:.1f} | FAVÖK Marjı: %{r['FAVÖK Marjı %']:.1f}")
-        md.append(f"- Satış Büyüme: %{r['Satış Büyüme %']:.1f} | "
-                  f"Borç/ÖzK: {r['Borç/Özkaynak']:.2f}")
-        flags = kirmizi_bayraklar(r)
-        if flags:
-            md.append("- ⚠️ " + " | ".join(f.replace('&gt;', '>') for f in flags))
-        md.append("")
-    md.append("\n---\n*Yatırım tavsiyesi değildir.*")
     return '\n'.join(md)
+
+
+# PDF rapor üretici (ayrı modülde — kalabalık olmasın diye)
+from pdf_rapor import pdf_uret
 
 
 # ==========================================================
@@ -530,13 +519,23 @@ def handle_document(message):
         # 4) Uyarı
         send_message(chat_id, uyari_mesaji())
 
-        # 5) Tam markdown rapor dosyası
-        md_text = markdown_rapor(skor, file_name)
-        md_path = Path(tmp) / (Path(file_name).stem + '_analiz.md')
-        md_path.write_text(md_text, encoding='utf-8')
-        send_chat_action(chat_id, 'upload_document')
-        send_document(chat_id, str(md_path),
-                      caption="📎 Tam rapor (Markdown)")
+        # 5) Tam PDF rapor
+        try:
+            send_chat_action(chat_id, 'upload_document')
+            pdf_bytes = pdf_uret(skor, file_name, top_n=TOP_N_DETAY)
+            pdf_path = Path(tmp) / (Path(file_name).stem + '_analiz.pdf')
+            pdf_path.write_bytes(pdf_bytes)
+            send_document(chat_id, str(pdf_path),
+                          caption="📎 <b>Tam Rapor (PDF)</b>")
+        except Exception as e:
+            print(f"PDF üretim hatası: {e}", file=sys.stderr)
+            traceback.print_exc()
+            # Yedek: PDF üretilemezse MD gönder
+            md_text = markdown_rapor(skor, file_name)
+            md_path = Path(tmp) / (Path(file_name).stem + '_analiz.md')
+            md_path.write_text(md_text, encoding='utf-8')
+            send_document(chat_id, str(md_path),
+                          caption="📎 Tam rapor (Markdown — PDF üretilemedi)")
 
 
 def handle_text(message):
