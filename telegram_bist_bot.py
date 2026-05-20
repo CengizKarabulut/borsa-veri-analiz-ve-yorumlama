@@ -622,28 +622,94 @@ def loop_mode():
 
 def once_mode():
     """Tek seferlik mod — GitHub Actions cron için.
-    Onaylanmamış mesajları çeker, hepsini işler, çıkar.
-    Telegram bekleyen update'leri offset ile siler."""
+    Onaylanmamış mesajları çeker, HER BİRİNİ İŞLEDİKTEN HEMEN SONRA
+    Telegram'a 'aldım' bildirir. Böylece bir sonraki cron tetiklenmesinde
+    aynı dosya tekrar işlenmez."""
     print("Tek seferlik mod.")
+
     res = get_updates(offset=0, timeout=0)
     if not res.get('ok'):
-        print("getUpdates başarısız.")
+        print(f"getUpdates başarısız: {res}", file=sys.stderr)
         return
+
     updates = res.get('result', [])
-    print(f"{len(updates)} update bulundu.")
-    last_offset = 0
+    if not updates:
+        print("Bekleyen mesaj yok.")
+        return
+
+    print(f"{len(updates)} update işlenecek.")
+
     for u in updates:
-        process_update(u)
-        last_offset = u['update_id'] + 1
-    if last_offset:
-        # Bunları onayla (Telegram bir sonraki çağrıda göndermesin)
-        requests.get(f"{API}/getUpdates",
-                     params={'offset': last_offset, 'timeout': 0}, timeout=10)
+        update_id = u['update_id']
+        try:
+            process_update(u)
+            print(f"  ✓ Update {update_id} işlendi.")
+        except Exception as e:
+            print(f"  ✗ Update {update_id} hatası: {e}", file=sys.stderr)
+            traceback.print_exc()
+
+        # KRİTİK: her update'ten HEMEN sonra acknowledge et.
+        # Bu sayede script çökerse bile, işlenmiş olanlar tekrar işlenmez.
+        next_offset = update_id + 1
+        for attempt in range(3):  # 3 deneme
+            try:
+                ack = requests.get(
+                    f"{API}/getUpdates",
+                    params={'offset': next_offset, 'timeout': 0, 'limit': 1},
+                    timeout=15
+                ).json()
+                if ack.get('ok'):
+                    print(f"  ✓ ACK update_id={update_id} (offset={next_offset})")
+                    break
+                else:
+                    print(f"  ⚠ ACK başarısız (deneme {attempt+1}): {ack}",
+                          file=sys.stderr)
+            except Exception as e:
+                print(f"  ⚠ ACK exception (deneme {attempt+1}): {e}",
+                      file=sys.stderr)
+            time.sleep(1)
+        else:
+            # 3 deneme de başarısızsa devam et (bir sonraki cron'da tekrar denenir)
+            print(f"  ✗ ACK kalıcı başarısız update_id={update_id}",
+                  file=sys.stderr)
+
     print("Tamam.")
 
 
+def ack_all_mode():
+    """Bekleyen TÜM mesajları işleme almadan acknowledge eder.
+    Kuyrukta birikmiş eski dosyaları temizlemek için kullanılır."""
+    print("Kuyruk temizleme modu — bekleyen mesajlar işlenmeden silinecek.")
+
+    res = get_updates(offset=0, timeout=0)
+    if not res.get('ok'):
+        print(f"getUpdates başarısız: {res}", file=sys.stderr)
+        return
+
+    updates = res.get('result', [])
+    if not updates:
+        print("Bekleyen mesaj zaten yok.")
+        return
+
+    last_update_id = max(u['update_id'] for u in updates)
+    next_offset = last_update_id + 1
+    print(f"{len(updates)} bekleyen mesaj bulundu, hepsi temizleniyor...")
+
+    ack = requests.get(
+        f"{API}/getUpdates",
+        params={'offset': next_offset, 'timeout': 0, 'limit': 1},
+        timeout=15
+    ).json()
+    if ack.get('ok'):
+        print(f"✓ {len(updates)} mesaj temizlendi (offset={next_offset}).")
+    else:
+        print(f"✗ Temizleme başarısız: {ack}", file=sys.stderr)
+
+
 if __name__ == "__main__":
-    if '--once' in sys.argv:
+    if '--ack-all' in sys.argv:
+        ack_all_mode()
+    elif '--once' in sys.argv:
         once_mode()
     else:
         loop_mode()
