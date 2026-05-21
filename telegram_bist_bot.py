@@ -146,18 +146,23 @@ def download_telegram_file(file_id, dest_dir):
 
 
 # ==========================================================
-# Analiz mantığı — 6 BOYUTLU GENİŞLETİLMİŞ SKORLAMA (v2)
+# Analiz mantığı — v3 GENİŞLETİLMİŞ SKORLAMA + KALİTE METRİKLERİ
 # ==========================================================
-# Ağırlıklar (toplam %100):
+# 6 ana boyut (toplam %100):
 #   Değerleme         %25  → F/K, PD/DD, FD/FAVÖK, PEG
-#   Karlılık          %25  → ROE, ROIC, ROA, Net/FAVÖK/Brüt Marj
-#   Büyüme (REEL)     %20  → Reel satış, Reel kâr, Çeyreklik momentum
-#   Bilanço Sağlığı   %15  → Borç/ÖzK, Cari, Likidite, Nakit, Borç/FAVÖK, Faiz Karş.
-#   Op. Verimlilik    %10  → Stok devir, DSO, Nakit Çevirme Süresi
-#   Piyasa Sinyalleri %5   → Yabancı Oran, Bilanço Sonrası Getiri, Volatilite (ters)
+#   Karlılık          %25  → ROE, ROIC, ROA, Net/FAVÖK/Brüt/Faaliyet Marj, Kâr Kalitesi
+#   Büyüme (REEL)     %20  → Reel satış, Reel kâr, Esas faal.kâr, Çeyreklik momentum, Marj trendi
+#   Bilanço Sağlığı   %15  → Borç/ÖzK, Cari, Likidite, Nakit, Borç/FAVÖK, Faiz Karş., +ALTMAN
+#   Op. Verimlilik    %10  → Stok devir, DSO, DOI, DPO, Nakit Çevirme, Aktif Devir
+#   Piyasa Sinyalleri %5   → Yabancı, Bilanço Sonrası, Volatilite, Devre Kesici
+#
+# EK KOMPOZİT METRİKLER (skorda gösterilir, kırmızı bayrak tetikler):
+#   • Piotroski F-Score (0-9) — kalite skoru (Türk uyarlaması: yıllık/çeyreklik karşılaştırma)
+#   • Altman Z-Score        — iflas risk skoru (klasik 5 değişkenli formül)
+#   • Esas Faaliyet Kâr Kalitesi (Faaliyet K / Net K)
 #
 # REEL büyüme = ((1 + nominal/100) / (1 + TÜFE/100) - 1) * 100
-# Kaynak: Yaşar Erdinç (19 mali oran) + CANSLIM (William O'Neil)
+# Kaynak: Yaşar Erdinç + CANSLIM (O'Neil) + Piotroski (1976-1996) + Altman (1968)
 # ==========================================================
 
 AGIRLIKLAR_V2 = {
@@ -183,14 +188,113 @@ def normalize(s, higher_better=True, clip_pct=(5, 95)):
 
 
 def _reel_buyume(nominal_series, tufe_series):
-    """Nominal büyümeyi TÜFE ile düzelterek reel büyüme döndürür.
-    Formül: ((1 + nominal/100) / (1 + tufe/100) - 1) * 100
-    Örn: nominal %150, TÜFE %32 → reel %89.4"""
+    """Reel = ((1+nom/100)/(1+tufe/100) - 1) * 100"""
     return ((1 + nominal_series/100) / (1 + tufe_series/100) - 1) * 100
 
 
 def _nan_series(df):
     return pd.Series([np.nan]*len(df), index=df.index)
+
+
+def _safe_div(a, b):
+    """Bölme (0'a bölünmeyi NaN yapar)."""
+    return a / b.replace(0, np.nan)
+
+
+def _piotroski_score(df):
+    """Piotroski F-Score (Türk piyasası uyarlaması, 0-9 puan).
+    
+    Kanonik Piotroski yıllık karşılaştırma gerektirir; Türk Excel'inde
+    sadece güncel dönem var, ama çeyreklik vs yıllık karşılaştırma ile
+    trend bilgisi var. Bu yüzden uyarlama yapıldı.
+    
+    A. Karlılık (4 puan):
+      1. ROA > 0
+      2. Net Kâr > 0
+      3. Çeyreklik kâr büyümesi pozitif (toparlanma / süreklilik)
+      4. Esas faaliyet kâr kalitesi (Faal.K/Net K) > 0.7
+    B. Kaldıraç/Likidite (3 puan):
+      5. Borç/Özkaynak < 1
+      6. Cari Oran > 1.5
+      7. Faiz Karşılama > 2 (veya negatif net borç)
+    C. Operasyonel (2 puan):
+      8. Marj trendi pozitif (çeyreklik FAVÖK marjı > yıllık)
+      9. Aktif Devir Hızı > 0.5 (varlık verimli kullanılıyor)
+    """
+    score = pd.Series(0, index=df.index, dtype=int)
+    detayli = pd.DataFrame(index=df.index)
+
+    # A. Karlılık
+    roa = df.get('Aktif Karlılığı', _nan_series(df))
+    detayli['P1_ROA_pozitif'] = (roa > 0).astype(int)
+    
+    net_kar = df.get('Dönem Kar / Zararı (Yıllık)', _nan_series(df))
+    detayli['P2_NetKar_pozitif'] = (net_kar > 0).astype(int)
+    
+    cey_kar = df.get('Ana Ortaklık Payları (Çeyreklik %)', _nan_series(df))
+    detayli['P3_CeyrekKar_pozitif'] = (cey_kar > 0).astype(int)
+    
+    fal_kar = df.get('Faaliyet Karı/Zararı (Yıllık)', _nan_series(df))
+    kar_kal = _safe_div(fal_kar, net_kar.abs())  # mutlak değer kullan
+    # Faaliyet kâr kalitesi: net kârın çoğu faaliyetten gelmeli
+    detayli['P4_KarKalitesi'] = ((kar_kal > 0.7) & (net_kar > 0)).astype(int)
+
+    # B. Kaldıraç/Likidite
+    de = df.get('Borç/ÖzKaynak', _nan_series(df))
+    detayli['P5_Borc_dusuk'] = ((de >= 0) & (de < 1)).astype(int)
+    
+    co = df.get('Cari Oranı', _nan_series(df))
+    detayli['P6_Cari_iyi'] = (co > 1.5).astype(int)
+    
+    fz = df.get('Faiz Karşılama Oranı', _nan_series(df))
+    # Faiz karşılama negatif veya >2 olabilir, veya net borç negatif
+    detayli['P7_Faiz_rahat'] = ((fz > 2) | (de < 0.1)).astype(int)
+
+    # C. Operasyonel
+    cey_marj = df.get('Favök Marjı (Çeyreklik %)', _nan_series(df))
+    yil_marj = df.get('Favök Marjı (Yıllık %)', _nan_series(df))
+    detayli['P8_Marj_iyileşiyor'] = (cey_marj > yil_marj).astype(int)
+    
+    aktif_devir = df.get('Aktif Devir Hızı', _nan_series(df))
+    detayli['P9_Aktif_verimli'] = (aktif_devir > 0.5).astype(int)
+
+    score = detayli.sum(axis=1)
+    return score, detayli
+
+
+def _altman_z(df):
+    """Klasik Altman Z-Score (1968, üretim şirketleri formülü).
+    
+    Z = 1.2*A + 1.4*B + 3.3*C + 0.6*D + 1.0*E
+      A = İşletme Sermayesi / Toplam Varlık
+      B = Birikmiş Kâr / Toplam Varlık
+      C = EBIT / Toplam Varlık
+      D = Piyasa Değeri Özsermaye / Toplam Yükümlülük
+      E = Satış / Toplam Varlık
+    
+    Z > 2.99 — Güvenli bölge
+    1.81 < Z < 2.99 — Gri bölge
+    Z < 1.81 — Tehlike (iflas riski)
+    """
+    aktif = df.get('Toplam Varlıklar', _nan_series(df))
+    donen = df.get('Dönen Varlıklar (Toplam)', _nan_series(df))
+    kvy = df.get('Kısa Vadeli Yükümlülükler', _nan_series(df))
+    gec_kar = df.get('Özkaynaklar Geçmiş Yıllar Kar/Zararları', _nan_series(df))
+    fal_kar = df.get('Faaliyet Karı/Zararı (Yıllık)', _nan_series(df))
+    pd_market = df.get('Piyasa Değeri', _nan_series(df))
+    top_yuk = df.get('Toplam Yükümlülükler', _nan_series(df))
+    satis = df.get('Satış Gelirleri (Yıllıklandırılmış)', _nan_series(df))
+
+    A = _safe_div(donen - kvy, aktif)
+    B = _safe_div(gec_kar, aktif)
+    C = _safe_div(fal_kar, aktif)
+    D = _safe_div(pd_market, top_yuk)
+    E = _safe_div(satis, aktif)
+
+    z = 1.2*A + 1.4*B + 3.3*C + 0.6*D + 1.0*E
+    # Aşırı uç değerleri makul aralığa kırp (görselleştirme için)
+    z = z.clip(-5, 15)
+    return z
 
 
 def skorla(df):
@@ -201,7 +305,6 @@ def skorla(df):
     out['Piyasa Değeri (mn TL)'] = df['Piyasa Değeri'] / 1e6
     out['Çalışan'] = df.get('Çalışan Sayısı', 0)
 
-    # TÜFE — makro oran, her satırda aynı değer
     tufe = df.get('TÜFE Yıllık', pd.Series([0]*len(df), index=df.index))
 
     # ============== 1) DEĞERLEME (%25) ==============
@@ -217,19 +320,26 @@ def skorla(df):
     out['PEG'] = peg
 
     out['Değerleme Skoru'] = pd.concat([
-        normalize(fk, False),
-        normalize(pddd, False),
-        normalize(ev, False),
-        normalize(peg_pos, False),
+        normalize(fk, False), normalize(pddd, False),
+        normalize(ev, False), normalize(peg_pos, False),
     ], axis=1).mean(axis=1)
 
-    # ============== 2) KARLILIK (%25) ==============
+    # ============== 2) KARLILIK (%25 — GENİŞLETİLDİ) ==============
     out['ROE %'] = df['Özsermaye Karlılığı']
     out['ROIC %'] = df['ROIC']
     out['ROA %'] = df.get('Aktif Karlılığı', _nan_series(df))
     out['Net Marj %'] = df['Net Kar Marjı (Yıllık %)']
     out['FAVÖK Marjı %'] = df['Favök Marjı (Yıllık %)']
     out['Brüt Marj %'] = df.get('Brüt Kar Marjı (Yıllık %)', _nan_series(df))
+
+    # YENİ: Faaliyet Kâr Marjı (esas faaliyet karlılığı)
+    fal_kar = df.get('Faaliyet Karı/Zararı (Yıllık)', _nan_series(df))
+    satis = df.get('Satış Gelirleri (Yıllıklandırılmış)', _nan_series(df))
+    out['Faaliyet Marj %'] = _safe_div(fal_kar, satis) * 100
+
+    # YENİ: Esas Faaliyet Kâr Kalitesi (Faal.K / Net K)
+    net_kar = df.get('Dönem Kar / Zararı (Yıllık)', _nan_series(df))
+    out['Kâr Kalitesi'] = _safe_div(fal_kar, net_kar.abs())
 
     out['Karlılık Skoru'] = pd.concat([
         normalize(df['Özsermaye Karlılığı']),
@@ -238,37 +348,50 @@ def skorla(df):
         normalize(df['Net Kar Marjı (Yıllık %)']),
         normalize(df['Favök Marjı (Yıllık %)']),
         normalize(out['Brüt Marj %']),
+        normalize(out['Faaliyet Marj %']),
+        normalize(out['Kâr Kalitesi'].clip(-2, 3)),  # extreme değer koruma
     ], axis=1).mean(axis=1)
 
-    # ============== 3) BÜYÜME — REEL (%20) ==============
-    # TÜFE düzeltilmiş! (CANSLIM C ve A unsurları)
+    # ============== 3) BÜYÜME — REEL (%20 — GENİŞLETİLDİ) ==============
     nom_satis = df['Satış Gelirleri (Yıllık %)']
     nom_kar = df['Ana Ortaklık Payları (Yıllık %)']
-    reel_satis = _reel_buyume(nom_satis, tufe)
-    reel_kar = _reel_buyume(nom_kar, tufe)
+    nom_faal = df.get('Faaliyet Karı/Zararı (Yıllık %)', _nan_series(df))
 
     out['Satış Büyüme Nominal %'] = nom_satis
     out['Kâr Büyüme Nominal %'] = nom_kar
-    out['Reel Satış %'] = reel_satis
-    out['Reel Kâr %'] = reel_kar
+    out['Reel Satış %'] = _reel_buyume(nom_satis, tufe)
+    out['Reel Kâr %'] = _reel_buyume(nom_kar, tufe)
+    out['Reel Faal.Kâr %'] = _reel_buyume(nom_faal, tufe)  # YENİ
     out['Çeyreklik Satış %'] = df.get('Satış Gelirleri (Çeyreklik %)', _nan_series(df))
     out['Çeyreklik Kâr %'] = df.get('Ana Ortaklık Payları (Çeyreklik %)', _nan_series(df))
 
+    # YENİ: Marj trendi (çeyreklik vs yıllık FAVÖK marjı)
+    cey_marj = df.get('Favök Marjı (Çeyreklik %)', _nan_series(df))
+    yil_marj = df.get('Favök Marjı (Yıllık %)', _nan_series(df))
+    out['Marj Trendi'] = cey_marj - yil_marj  # pozitif iyi
+
     out['Büyüme Skoru'] = pd.concat([
-        normalize(reel_satis),
-        normalize(reel_kar),
+        normalize(out['Reel Satış %']),
+        normalize(out['Reel Kâr %']),
+        normalize(out['Reel Faal.Kâr %']),
         normalize(out['Çeyreklik Satış %']),
         normalize(out['Çeyreklik Kâr %']),
+        normalize(out['Marj Trendi']),
     ], axis=1).mean(axis=1)
 
-    # ============== 4) BİLANÇO SAĞLIĞI (%15) ==============
+    # ============== 4) BİLANÇO SAĞLIĞI (%15 — ALTMAN EKLENDİ) ==============
     out['Borç/Özkaynak'] = df['Borç/ÖzKaynak']
     out['Cari Oran'] = df['Cari Oranı']
     out['Likidite Oranı'] = df.get('Likidite Oranı', _nan_series(df))
     out['Nakit Oranı'] = df.get('Nakit Oranı', _nan_series(df))
     out['Borç/FAVÖK'] = df.get('Borç Favök', _nan_series(df))
     out['Faiz Karşılama'] = df.get('Faiz Karşılama Oranı', _nan_series(df))
+    out['Finansal Borç Oranı'] = df.get('Finansal Borç Oranı', _nan_series(df))  # YENİ
+    out['Kaldıraç Oranı'] = df.get('Kaldıraç Oranı', _nan_series(df))  # YENİ
     out['Net YPP'] = df.get('Net Yabancı Para Pozisyonu', _nan_series(df))
+
+    # ⭐ ALTMAN Z-SCORE
+    out['Altman Z'] = _altman_z(df)
 
     bf_series = df.get('Borç Favök', _nan_series(df))
     out['Bilanço Skoru'] = pd.concat([
@@ -278,30 +401,50 @@ def skorla(df):
         normalize(out['Nakit Oranı']),
         normalize(bf_series.where(bf_series >= 0), False),
         normalize(out['Faiz Karşılama'].where(out['Faiz Karşılama'] >= 0)),
+        normalize(out['Finansal Borç Oranı'], False),
+        normalize(out['Altman Z']),  # ⭐ Altman skor olarak dahil
     ], axis=1).mean(axis=1)
 
-    # ============== 5) OPERASYONEL VERİMLİLİK (%10) ==============
+    # ============== 5) OP. VERİMLİLİK (%10 — GENİŞLETİLDİ) ==============
     out['Stok Devir'] = df.get('Stok Devir Hızı', _nan_series(df))
     out['DSO'] = df.get('Alacak Tahsilat Süresi (DSO)', _nan_series(df))
     out['Nakit Çevirme'] = df.get('Nakit Çevirme Süresi', _nan_series(df))
+    out['Aktif Devir'] = df.get('Aktif Devir Hızı', _nan_series(df))  # YENİ
+    out['DOI'] = df.get('Stokta Bekleme Süresi (DOI)', _nan_series(df))  # YENİ
+    out['DPO'] = df.get('Borç Ödeme Süresi (DPO)', _nan_series(df))  # YENİ
 
     out['Verimlilik Skoru'] = pd.concat([
         normalize(out['Stok Devir'].where(out['Stok Devir'] >= 0)),
         normalize(out['DSO'].where(out['DSO'] >= 0), False),
         normalize(out['Nakit Çevirme'], False),
+        normalize(out['Aktif Devir']),
+        normalize(out['DOI'].where(out['DOI'] >= 0), False),
+        normalize(out['DPO'].where(out['DPO'] >= 0)),  # uzun DPO iyi (geç öderim)
     ], axis=1).mean(axis=1)
 
-    # ============== 6) PİYASA SİNYALLERİ (%5) ==============
+    # ============== 6) PİYASA SİNYALLERİ (%5 — GENİŞLETİLDİ) ==============
     out['Yabancı Oran %'] = df.get('Yabancı Oran', _nan_series(df))
+    out['Yabancı Etki %'] = df.get('Yabancı Oran Etki %', _nan_series(df))  # YENİ
     out['Bilanço Sonrası %'] = df.get('Bilanço Sonrası Getiri (%)', _nan_series(df))
     out['Volatilite'] = df.get('Volatilite', _nan_series(df))
     out['Fiili Dolaşım %'] = df.get('Fiili Dolaşım (%)', _nan_series(df))
+    out['Devre Kesici'] = df.get('Devre Kesici Sayısı (Son 6 Ay)', _nan_series(df))  # YENİ
 
     out['Piyasa Skoru'] = pd.concat([
         normalize(out['Yabancı Oran %']),
+        normalize(out['Yabancı Etki %']),
         normalize(out['Bilanço Sonrası %']),
         normalize(out['Volatilite'], False),
+        normalize(out['Devre Kesici'], False),
     ], axis=1).mean(axis=1)
+
+    # ============== ⭐ EK KOMPOZİT KALİTE METRİKLERİ ==============
+    # Piotroski F-Score (0-9)
+    pscore, pdetayli = _piotroski_score(df)
+    out['Piotroski F-Score'] = pscore
+    # Detaylar (debug için, görüntülenmez)
+    for c in pdetayli.columns:
+        out[c] = pdetayli[c]
 
     # ============== TOPLAM SKOR ==============
     out['TOPLAM SKOR'] = (
@@ -313,11 +456,20 @@ def skorla(df):
         + AGIRLIKLAR_V2['piyasa'] * out['Piyasa Skoru'].fillna(0)
     )
 
-    # Eski kod uyumu (PDF/kart kodu bu adları beklediği yerlerde)
+    # Geri uyum (PDF/kart kodu için)
     out['Satış Büyüme %'] = out['Reel Satış %']
     out['Kâr Büyüme %'] = out['Reel Kâr %']
 
     return out.sort_values('TOPLAM SKOR', ascending=False).reset_index(drop=True)
+
+AGIRLIKLAR_V2 = {
+    'degerleme': 0.25,
+    'karlilik':  0.25,
+    'buyume':    0.20,
+    'bilanco':   0.15,
+    'verimlilik': 0.10,
+    'piyasa':    0.05,
+}
 
 
 def kirmizi_bayraklar(row):
@@ -343,6 +495,29 @@ def kirmizi_bayraklar(row):
         flags.append(f"Volatilite yüksek ({row['Volatilite']:.1f})")
     if pd.notna(row['Fiili Dolaşım %']) and row['Fiili Dolaşım %'] < 25:
         flags.append(f"Fiili dolaşım düşük (%{row['Fiili Dolaşım %']:.1f}) — likidite sınırlı")
+
+    # YENİ: Altman Z-Score uyarısı (iflas riski)
+    az = row.get('Altman Z')
+    if pd.notna(az):
+        if az < 1.81:
+            flags.append(f"🚨 Altman Z-Score {az:.2f} (&lt; 1.81) — İFLAS RİSKİ BÖLGESİNDE")
+        elif az < 2.99:
+            flags.append(f"Altman Z-Score {az:.2f} — gri bölge (dikkat)")
+
+    # YENİ: Piotroski F-Score uyarısı (düşük kalite)
+    ps = row.get('Piotroski F-Score')
+    if pd.notna(ps) and ps <= 3:
+        flags.append(f"Piotroski F-Score {int(ps)}/9 — DÜŞÜK KALİTE")
+
+    # YENİ: Esas faaliyet kâr kalitesi
+    kk = row.get('Kâr Kalitesi')
+    if pd.notna(kk) and 0 < kk < 0.5 and pd.notna(row.get('Net Marj %')) and row['Net Marj %'] > 0:
+        flags.append(f"Faaliyet K./Net K. = {kk:.2f} — net karın yarısından azı esas faaliyetten")
+
+    # YENİ: Faiz karşılama kritik
+    if pd.notna(row.get('Faiz Karşılama')) and 0 < row['Faiz Karşılama'] < 1.5:
+        flags.append(f"Faiz Karşılama {row['Faiz Karşılama']:.1f} — faiz yükü kritik")
+
     return flags
 
 
@@ -384,9 +559,13 @@ def baslik_mesaji(skor_df):
         "",
         f"• Analiz edilen hisse: <b>{n}</b>",
         f"• Zarar eden hisse: <b>{zarar}</b> (toplamın %{zarar*100/n:.0f}'i)",
-        f"• <b>6 boyutlu skorlama</b> (Yaşar Erdinç + CANSLIM)",
+        f"• <b>6 boyutlu skorlama</b> + Piotroski F-Score + Altman Z-Score",
         f"   Değerleme %25 · Karlılık %25 · Büyüme(REEL) %20",
         f"   Bilanço %15 · Verimlilik %10 · Piyasa %5",
+        "",
+        f"<i>💡 Her hisse kartında boyut başlıklarının yanında o boyutun ham skoru "
+        f"görüntülenir (örn. '💵 Değerleme — 94/100'). Detaylı metrik açıklamaları "
+        f"PDF raporun son sayfasında.</i>",
     ]
     if baglam:
         msg += ["", f"💡 <i>{he(baglam)}</i>"]
@@ -428,6 +607,30 @@ def hisse_kart_mesaji(row, sira):
     pd_str = f"{pd_val/1000:.1f} mlr TL" if pd_val >= 1000 else f"{pd_val:.0f} mn TL"
     cal = int(row['Çalışan']) if pd.notna(row['Çalışan']) else "—"
     lines.append(f"   💰 PD: {pd_str}  •  👥 Çalışan: {cal}")
+
+    # ⭐ KALİTE SKORLARI (Piotroski + Altman) — yeni
+    ps = row.get('Piotroski F-Score')
+    az = row.get('Altman Z')
+    if pd.notna(ps) or pd.notna(az):
+        lines.append("")
+        lines.append("<b>⭐ Kalite Skorları</b>")
+        if pd.notna(ps):
+            ps_int = int(ps)
+            if ps_int >= 7: ps_y = " <i>(yüksek kalite ✓)</i>"
+            elif ps_int >= 5: ps_y = " <i>(orta)</i>"
+            else: ps_y = " <i>(düşük kalite!)</i>"
+            lines.append(f"   Piotroski F-Score: <b>{ps_int}/9</b>{ps_y}")
+        if pd.notna(az):
+            if az < 1.81: az_y = " <i>(🚨 iflas riski)</i>"
+            elif az < 2.99: az_y = " <i>(gri bölge)</i>"
+            else: az_y = " <i>(güvenli ✓)</i>"
+            lines.append(f"   Altman Z-Score: <b>{az:.2f}</b>{az_y}")
+        kk = row.get('Kâr Kalitesi')
+        if pd.notna(kk):
+            if 0.8 <= kk <= 1.5: kk_y = " <i>(temiz kâr)</i>"
+            elif 0 < kk < 0.5: kk_y = " <i>(faaliyet dışı dominant)</i>"
+            else: kk_y = ""
+            lines.append(f"   Faal.K/Net K: <b>{kk:.2f}</b>{kk_y}")
     lines.append("")
 
     # 1) DEĞERLEME
@@ -438,7 +641,7 @@ def hisse_kart_mesaji(row, sira):
         elif row['F/K'] < 15: fk_y = " <i>(makul)</i>"
         elif row['F/K'] < 25: fk_y = " <i>(ortalama)</i>"
         else: fk_y = " <i>(pahalı)</i>"
-    lines.append("<b>💵 Değerleme</b>")
+    lines.append(f"<b>💵 Değerleme — {row['Değerleme Skoru']:.0f}/100</b>")
     lines.append(f"   F/K: <b>{row['F/K']:.1f}</b>{fk_y}")
     if pd.notna(row['PD/DD']):
         lines.append(f"   PD/DD: <b>{row['PD/DD']:.1f}</b>")
@@ -452,7 +655,7 @@ def hisse_kart_mesaji(row, sira):
 
     # 2) KARLILIK
     lines.append("")
-    lines.append("<b>📈 Karlılık</b>")
+    lines.append(f"<b>📈 Karlılık — {row['Karlılık Skoru']:.0f}/100</b>")
     if pd.notna(row['ROE %']):
         roe_y = ""
         if row['ROE %'] < 0: roe_y = " <i>(zarar)</i>"
@@ -475,10 +678,12 @@ def hisse_kart_mesaji(row, sira):
         lines.append(f"   FAVÖK Marjı: <b>%{row['FAVÖK Marjı %']:.1f}</b>{em_y}")
     if pd.notna(row['Brüt Marj %']):
         lines.append(f"   Brüt Marj: <b>%{row['Brüt Marj %']:.1f}</b>")
+    if pd.notna(row.get('Faaliyet Marj %')):
+        lines.append(f"   Faaliyet Marjı: <b>%{row['Faaliyet Marj %']:.1f}</b>")
 
     # 3) BÜYÜME (REEL!)
     lines.append("")
-    lines.append("<b>🚀 Büyüme (TÜFE düzeltmeli)</b>")
+    lines.append(f"<b>🚀 Büyüme (TÜFE düzeltmeli) — {row['Büyüme Skoru']:.0f}/100</b>")
     if pd.notna(row['Reel Satış %']):
         sb = row['Reel Satış %']
         sb_y = ""
@@ -498,10 +703,16 @@ def hisse_kart_mesaji(row, sira):
         lines.append(f"   Çeyrek Satış: <b>%{row['Çeyreklik Satış %']:.1f}</b>")
     if pd.notna(row['Çeyreklik Kâr %']):
         lines.append(f"   Çeyrek Kâr: <b>%{row['Çeyreklik Kâr %']:,.1f}</b>")
+    if pd.notna(row.get('Reel Faal.Kâr %')):
+        lines.append(f"   Reel Faal.Kâr: <b>%{row['Reel Faal.Kâr %']:.1f}</b>")
+    if pd.notna(row.get('Marj Trendi')):
+        mt = row['Marj Trendi']
+        mt_y = " <i>(iyileşiyor)</i>" if mt > 1 else (" <i>(bozuluyor)</i>" if mt < -1 else " <i>(stabil)</i>")
+        lines.append(f"   FAVÖK Marj Trendi: <b>{mt:+.1f} pp</b>{mt_y}")
 
     # 4) BİLANÇO
     lines.append("")
-    lines.append("<b>🏦 Bilanço Sağlığı</b>")
+    lines.append(f"<b>🏦 Bilanço Sağlığı — {row['Bilanço Skoru']:.0f}/100</b>")
     if pd.notna(row['Borç/Özkaynak']):
         de = row['Borç/Özkaynak']
         de_y = ""
@@ -517,29 +728,38 @@ def hisse_kart_mesaji(row, sira):
     if pd.notna(row['Likidite Oranı']):
         lines.append(f"   Likidite (asit-test): <b>{row['Likidite Oranı']:.2f}</b>")
     if pd.notna(row['Faiz Karşılama']):
+        v = row['Faiz Karşılama']
         fk_y = ""
-        if row['Faiz Karşılama'] < 1.5: fk_y = " <i>(kritik!)</i>"
-        elif row['Faiz Karşılama'] < 3: fk_y = " <i>(zayıf)</i>"
-        elif row['Faiz Karşılama'] > 10: fk_y = " <i>(çok güçlü)</i>"
-        lines.append(f"   Faiz Karşılama: <b>{row['Faiz Karşılama']:.1f}</b>{fk_y}")
+        if 0 < v < 1.5: fk_y = " <i>(kritik!)</i>"
+        elif 1.5 <= v < 3: fk_y = " <i>(zayıf)</i>"
+        elif v > 10: fk_y = " <i>(çok güçlü)</i>"
+        elif v < 0: fk_y = " <i>(net faiz geliri var)</i>"
+        lines.append(f"   Faiz Karşılama: <b>{v:.1f}</b>{fk_y}")
 
-    # 5) OPERASYONEL VERİMLİLİK (YENİ)
-    if any(pd.notna(row.get(k)) for k in ['Stok Devir', 'DSO', 'Nakit Çevirme']):
+    # 5) OPERASYONEL VERİMLİLİK
+    if any(pd.notna(row.get(k)) for k in ['Stok Devir', 'DSO', 'Nakit Çevirme', 'Aktif Devir']):
         lines.append("")
-        lines.append("<b>⚙️ Operasyonel Verimlilik</b>")
+        lines.append(f"<b>⚙️ Op. Verimlilik — {row['Verimlilik Skoru'] if pd.notna(row['Verimlilik Skoru']) else 0:.0f}/100</b>")
+        if pd.notna(row.get('Aktif Devir')):
+            ad_y = " <i>(yüksek varlık verimi)</i>" if row['Aktif Devir'] > 1.5 else (" <i>(düşük)</i>" if row['Aktif Devir'] < 0.5 else "")
+            lines.append(f"   Aktif Devir: <b>{row['Aktif Devir']:.2f}</b>x{ad_y}")
         if pd.notna(row.get('Stok Devir')):
             lines.append(f"   Stok Devir: <b>{row['Stok Devir']:.1f}</b>x")
+        if pd.notna(row.get('DOI')):
+            lines.append(f"   Stok Bekleme (DOI): <b>{row['DOI']:.0f} gün</b>")
         if pd.notna(row.get('DSO')):
-            dso_y = " <i>(hızlı tahsilat)</i>" if row['DSO'] < 60 else (" <i>(yavaş)</i>" if row['DSO'] > 120 else "")
-            lines.append(f"   Tahsilat Süresi: <b>{row['DSO']:.0f} gün</b>{dso_y}")
+            dso_y = " <i>(hızlı)</i>" if row['DSO'] < 60 else (" <i>(yavaş)</i>" if row['DSO'] > 120 else "")
+            lines.append(f"   Tahsilat (DSO): <b>{row['DSO']:.0f} gün</b>{dso_y}")
+        if pd.notna(row.get('DPO')):
+            lines.append(f"   Borç Ödeme (DPO): <b>{row['DPO']:.0f} gün</b>")
         if pd.notna(row.get('Nakit Çevirme')):
-            nc_y = " <i>(çok iyi)</i>" if row['Nakit Çevirme'] < 0 else ""
+            nc_y = " <i>(çok iyi: önce alır sonra öder)</i>" if row['Nakit Çevirme'] < 0 else ""
             lines.append(f"   Nakit Çevirme: <b>{row['Nakit Çevirme']:.0f} gün</b>{nc_y}")
 
     # 6) PİYASA SİNYALLERİ (YENİ)
     if any(pd.notna(row.get(k)) for k in ['Yabancı Oran %', 'Bilanço Sonrası %', 'Volatilite']):
         lines.append("")
-        lines.append("<b>📡 Piyasa Sinyalleri</b>")
+        lines.append(f"<b>📡 Piyasa Sinyalleri — {row['Piyasa Skoru']:.0f}/100</b>")
         if pd.notna(row.get('Yabancı Oran %')):
             yo = row['Yabancı Oran %']
             yo_y = " <i>(yüksek kurumsal ilgi)</i>" if yo > 20 else " <i>(düşük)</i>" if yo < 3 else ""
