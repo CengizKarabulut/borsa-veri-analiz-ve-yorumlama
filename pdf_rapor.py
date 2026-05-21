@@ -142,6 +142,20 @@ def _kirmizi_bayraklar(row):
         flags.append(f"Volatilite yüksek ({row['Volatilite']:.1f}).")
     if pd.notna(row.get('Fiili Dolaşım %')) and row['Fiili Dolaşım %'] < 25:
         flags.append(f"Fiili dolaşım düşük (%{row['Fiili Dolaşım %']:.1f}) — likidite sınırlı.")
+    # YENİ: Altman Z-Score
+    az = row.get('Altman Z')
+    if pd.notna(az):
+        if az < 1.81:
+            flags.append(f"🚨 Altman Z-Score {az:.2f} — İFLAS RİSKİ BÖLGESİ.")
+        elif az < 2.99:
+            flags.append(f"Altman Z-Score {az:.2f} — gri bölge.")
+    # YENİ: Piotroski F-Score düşük
+    ps = row.get('Piotroski F-Score')
+    if pd.notna(ps) and ps <= 3:
+        flags.append(f"Piotroski F-Score {int(ps)}/9 — düşük kalite.")
+    # YENİ: Faiz karşılama kritik
+    if pd.notna(row.get('Faiz Karşılama')) and 0 < row['Faiz Karşılama'] < 1.5:
+        flags.append(f"Faiz Karşılama {row['Faiz Karşılama']:.1f} — faiz yükü kritik.")
     return flags
 
 
@@ -166,8 +180,9 @@ def pdf_uret(skor_df, kaynak_dosya, top_n=10):
     elems.append(Spacer(1, 25*mm))
     elems.append(Paragraph("BIST Sektör Analiz Raporu", styles['Baslik']))
     elems.append(Paragraph(str(sektor), styles['AltBaslik']))
-    elems.append(Paragraph("<i>6 Boyutlu Skorlama (Yaşar Erdinç + CANSLIM)</i>",
-                           styles['AltBaslik']))
+    elems.append(Paragraph(
+        "<i>6 Boyutlu Skorlama + Piotroski F-Score + Altman Z-Score</i>",
+        styles['AltBaslik']))
     elems.append(Spacer(1, 15*mm))
 
     ozet_data = [
@@ -175,8 +190,10 @@ def pdf_uret(skor_df, kaynak_dosya, top_n=10):
         ['Analiz edilen hisse:', f"{n}"],
         ['Zarar eden hisse:', f"{zarar}  (toplamın %{zarar*100/n:.0f}'i)"],
         ['Skorlama ağırlıkları:', "Değerleme %25 · Karlılık %25 · Büyüme(REEL) %20"],
-        ['', "Bilanço %15 · Op.Verimlilik %10 · Piyasa Sinyali %5"],
+        ['', "Bilanço(+Altman) %15 · Op.Verimlilik %10 · Piyasa %5"],
         ['Büyüme hesabı:', "TÜFE düzeltmeli reel büyüme (CANSLIM yaklaşımı)"],
+        ['Kalite metrikleri:', "Piotroski F-Score (0-9) · Altman Z-Score · Kâr Kalitesi"],
+        ['Kaynaklar:', "Yaşar Erdinç + CANSLIM + Piotroski (1976) + Altman (1968)"],
     ]
     ozet_tbl = Table(ozet_data, colWidths=[50*mm, 115*mm])
     ozet_tbl.setStyle(TableStyle([
@@ -312,9 +329,10 @@ def pdf_uret(skor_df, kaynak_dosya, top_n=10):
 
     def _faiz_y(v):
         if pd.isna(v): return ''
-        if v < 1.5: return 'kritik!'
-        if v < 3: return 'zayıf'
+        if 0 < v < 1.5: return 'kritik!'
+        if 1.5 <= v < 3: return 'zayıf'
         if v > 10: return 'çok güçlü'
+        if v < 0: return 'net faiz geliri'
         return ''
 
     for i, row in skor_df.head(top_n).iterrows():
@@ -346,47 +364,88 @@ def pdf_uret(skor_df, kaynak_dosya, top_n=10):
         meta = (f"<font size=8 color='#595959'>PD: {pv_str} &nbsp;·&nbsp; "
                 f"Çalışan: {cal}</font>")
         card_elems.append(Paragraph(meta, styles['Normal2']))
+
+        # ⭐ Kalite Skorları satırı (Piotroski + Altman + Kâr Kalitesi)
+        ps = row.get('Piotroski F-Score')
+        az = row.get('Altman Z')
+        kk = row.get('Kâr Kalitesi')
+        if pd.notna(ps) or pd.notna(az) or pd.notna(kk):
+            quality_parts = []
+            if pd.notna(ps):
+                ps_int = int(ps)
+                ps_clr = '#548235' if ps_int >= 7 else ('#C65911' if ps_int >= 4 else '#C00000')
+                quality_parts.append(
+                    f"<font color='{ps_clr}'><b>Piotroski {ps_int}/9</b></font>")
+            if pd.notna(az):
+                if az >= 2.99: az_clr, az_lbl = '#548235', 'güvenli'
+                elif az >= 1.81: az_clr, az_lbl = '#C65911', 'gri'
+                else: az_clr, az_lbl = '#C00000', 'iflas riski'
+                quality_parts.append(
+                    f"<font color='{az_clr}'><b>Altman Z {az:.2f}</b> ({az_lbl})</font>")
+            if pd.notna(kk):
+                quality_parts.append(f"<b>Faal.K/Net K: {kk:.2f}</b>")
+            quality_line = " &nbsp;·&nbsp; ".join(quality_parts)
+            card_elems.append(Paragraph(
+                f"<font size=9>⭐ {quality_line}</font>", styles['Normal2']))
+
         card_elems.append(Spacer(1, 2*mm))
 
-        # 6 kutu — 3x2 grid
-        box_deg = _box("Değerleme", [
+        # 6 kutu — 3x2 grid (zenginleştirilmiş içerik + alt skor başlıkta)
+        s_deg = row['Değerleme Skoru']
+        s_kar = row['Karlılık Skoru']
+        s_buy = row['Büyüme Skoru']
+        s_bil = row['Bilanço Skoru']
+        s_vrm = row['Verimlilik Skoru']
+        s_piy = row['Piyasa Skoru']
+
+        def _h(name, score):
+            ss = f"{score:.0f}" if pd.notna(score) else "—"
+            return f"{name} — {ss}/100"
+
+        box_deg = _box(_h("Değerleme", s_deg), [
             ('F/K', _fmt(row['F/K'], 1), _fk_y(row['F/K'])),
             ('PD/DD', _fmt(row['PD/DD'], 1), ''),
             ('FD/FAVÖK', _fmt(row['FD/FAVÖK'], 1), ''),
             ('PEG', _fmt(row.get('PEG'), 2), ''),
         ])
-        box_kar = _box("Karlılık", [
+        box_kar = _box(_h("Karlılık", s_kar), [
             ('ROE', f"%{_fmt(row['ROE %'], 1)}", _roe_y(row['ROE %'])),
             ('ROIC', f"%{_fmt(row['ROIC %'], 1)}", ''),
             ('ROA', f"%{_fmt(row.get('ROA %'), 1)}", ''),
             ('Net Marj', f"%{_fmt(row['Net Marj %'], 1)}", ''),
             ('FAVÖK', f"%{_fmt(row['FAVÖK Marjı %'], 1)}",
              _em_y(row['FAVÖK Marjı %'])),
+            ('Faaliyet', f"%{_fmt(row.get('Faaliyet Marj %'), 1)}", ''),
             ('Brüt', f"%{_fmt(row.get('Brüt Marj %'), 1)}", ''),
         ])
-        box_buy = _box("Büyüme (REEL)", [
+        box_buy = _box(_h("Büyüme (REEL)", s_buy), [
             ('Satış', f"%{_fmt(row.get('Reel Satış %'), 1)}",
              _sb_y(row.get('Reel Satış %'))),
             ('Kâr', f"%{_fmt(row.get('Reel Kâr %'), 1)}", ''),
+            ('Faal.Kâr', f"%{_fmt(row.get('Reel Faal.Kâr %'), 1)}", ''),
             ('Çey.Satış', f"%{_fmt(row.get('Çeyreklik Satış %'), 1)}", ''),
-            ('Çey.Kâr', f"%{_fmt(row.get('Çeyreklik Kâr %'), 1)}", ''),
+            ('Marj Tr.', f"{_fmt(row.get('Marj Trendi'), 1)} pp", ''),
         ])
-        box_bil = _box("Bilanço", [
+        box_bil = _box(_h("Bilanço", s_bil), [
             ('Borç/ÖzK', _fmt(row['Borç/Özkaynak'], 2), _de_y(row['Borç/Özkaynak'])),
             ('Cari', _fmt(row['Cari Oran'], 2), _co_y(row['Cari Oran'])),
             ('Likidite', _fmt(row.get('Likidite Oranı'), 2), ''),
             ('Faiz Karş.', _fmt(row.get('Faiz Karşılama'), 1),
              _faiz_y(row.get('Faiz Karşılama'))),
+            ('Fin.Borç', _fmt(row.get('Finansal Borç Oranı'), 2), ''),
         ])
-        box_vrm = _box("Op. Verimlilik", [
+        box_vrm = _box(_h("Op. Verimlilik", s_vrm), [
+            ('Aktif Devir', _fmt(row.get('Aktif Devir'), 2) + 'x', ''),
             ('Stok Devir', _fmt(row.get('Stok Devir'), 1) + 'x', ''),
             ('DSO', _fmt(row.get('DSO'), 0) + ' gün', ''),
+            ('DPO', _fmt(row.get('DPO'), 0) + ' gün', ''),
             ('Nakit Çev.', _fmt(row.get('Nakit Çevirme'), 0) + ' gün', ''),
         ])
-        box_piy = _box("Piyasa Sinyali", [
+        box_piy = _box(_h("Piyasa Sinyali", s_piy), [
             ('Yabancı', f"%{_fmt(row.get('Yabancı Oran %'), 1)}", ''),
             ('Bil.Sonr.', f"%{_fmt(row.get('Bilanço Sonrası %'), 1)}", ''),
             ('Volatilite', _fmt(row.get('Volatilite'), 1), ''),
+            ('Dev.Kesici', _fmt(row.get('Devre Kesici'), 0), ''),
         ])
 
         # 3 sütunlu, 2 satırlı grid
@@ -419,23 +478,107 @@ def pdf_uret(skor_df, kaynak_dosya, top_n=10):
         card_elems.append(Spacer(1, 4*mm))
         elems.append(KeepTogether(card_elems))
 
-    # ---- METODOLOJİ + UYARI ----
+    # ---- METODOLOJİ + METRİK SÖZLÜĞÜ + UYARI ----
     elems.append(PageBreak())
-    elems.append(Paragraph("Skorlama Metodolojisi", styles['SectionTitle']))
+    elems.append(Paragraph("Skorlama Metodolojisi ve Metrik Sözlüğü",
+                           styles['SectionTitle']))
+
     elems.append(Paragraph(
-        "<b>Yaşar Erdinç</b> (19 mali oran) ve <b>William O'Neil'in CANSLIM</b> "
-        "metodolojisinden uyarlanan 6 boyutlu skorlama. Her metrik sektör içi "
-        "%5-95 persentilde normalize edilir (uç değerler bastırılır), 0-100'e "
-        "ölçeklenir.<br/><br/>"
-        "<b>REEL büyüme hesabı:</b> Nominal büyüme TÜFE ile düzeltilir — "
-        "formül: <i>reel = ((1+nom/100)/(1+TÜFE/100) - 1) × 100</i>. "
-        "Örnek: nominal %150, TÜFE %32 → reel %89. "
-        "CANSLIM'in C ve A unsurları (çeyreklik ve yıllık reel kâr büyümesi) "
-        "bu sayede ölçülebilir hale gelir.<br/><br/>"
-        "<b>Kırmızı bayraklar</b> otomatik tetiklenen uyarılardır: Net Marj &gt; "
-        "FAVÖK Marjı (faaliyet dışı kâr), F/K negatif, Cari Oran &lt; 1, "
-        "Faiz Karşılama &lt; 1.5, Yatırım/Holding yapısı, baz etkili büyüme, "
-        "büyük negatif döviz pozisyonu, yüksek volatilite, düşük fiili dolaşım.",
+        "<b>Toplam skor</b>, 6 alt boyutun ağırlıklı ortalamasıdır. Her metrik sektör "
+        "içi %5-95 persentilde normalize edilir (uç değerler bastırılır) ve 0-100 "
+        "aralığına ölçeklenir.",
+        styles['Normal2']))
+    elems.append(Spacer(1, 4*mm))
+
+    # Her boyutun detaylı tablosu
+    methodology_rows = [
+        ['Boyut', 'Ağırlık', 'İçerdiği Metrikler'],
+        ['Değerleme', '%25',
+         'F/K (düşük iyi), PD/DD (düşük iyi), FD/FAVÖK (düşük iyi), PEG (düşük iyi)'],
+        ['Karlılık', '%25',
+         'ROE, ROIC, ROA, Net/FAVÖK/Brüt/Faaliyet Marjı, Esas Faaliyet Kâr Kalitesi'],
+        ['Büyüme (REEL)', '%20',
+         'Reel Satış, Reel Kâr, Reel Faal.Kâr (hepsi TÜFE düzeltmeli), '
+         'Çeyreklik Satış/Kâr momentumu, FAVÖK Marj Trendi'],
+        ['Bilanço Sağlığı', '%15',
+         'Borç/Özkaynak (ters), Cari Oran, Likidite Oranı, Nakit Oranı, '
+         'Borç/FAVÖK (ters), Faiz Karşılama, Finansal Borç Oranı, Altman Z-Score'],
+        ['Op. Verimlilik', '%10',
+         'Aktif Devir Hızı, Stok Devir Hızı, DOI (ters), DSO (ters), DPO, '
+         'Nakit Çevirme Süresi (ters)'],
+        ['Piyasa Sinyali', '%5',
+         'Yabancı Oran, Yabancı Etki, Bilanço Sonrası Getiri, '
+         'Volatilite (ters), Devre Kesici (ters)'],
+    ]
+    meth_tbl = Table(methodology_rows, colWidths=[30*mm, 18*mm, 132*mm])
+    meth_tbl.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), BLUE),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), F_BOLD),
+        ('FONTSIZE', (0, 0), (-1, -1), 8.5),
+        ('FONTNAME', (0, 1), (0, -1), F_BOLD),
+        ('FONTNAME', (1, 1), (1, -1), F_BOLD),
+        ('ALIGN', (1, 0), (1, -1), 'CENTER'),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('GRID', (0, 0), (-1, -1), 0.3, LIGHT_GREY),
+        ('TOPPADDING', (0, 0), (-1, -1), 4),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ('LEFTPADDING', (0, 0), (-1, -1), 5),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 5),
+    ]))
+    elems.append(meth_tbl)
+
+    elems.append(Spacer(1, 6*mm))
+    elems.append(Paragraph("Ek Kompozit Kalite Skorları", styles['SectionTitle']))
+    elems.append(Paragraph(
+        "<b>Piotroski F-Score (0-9)</b> — Joseph Piotroski'nin 1976-1996 verilerinde "
+        "geliştirdiği 9 maddelik kalite testi. Türk Excel verisi için uyarlanmış "
+        "versiyon. Her madde 1 puan: "
+        "<i>(1) ROA &gt; 0 · (2) Net Kâr &gt; 0 · (3) Çeyreklik kâr büyümesi pozitif · "
+        "(4) Faaliyet K./Net K. &gt; 0.7 · (5) Borç/Özkaynak &lt; 1 · "
+        "(6) Cari Oran &gt; 1.5 · (7) Faiz Karşılama &gt; 2 (veya net borç negatif) · "
+        "(8) Marj iyileşiyor · (9) Aktif Devir &gt; 0.5</i>. "
+        "Yorum: <b>7-9 yüksek kalite</b>, 4-6 orta, <b>0-3 düşük kalite</b>.",
+        styles['Normal2']))
+    elems.append(Spacer(1, 3*mm))
+    elems.append(Paragraph(
+        "<b>Altman Z-Score</b> — Edward Altman'ın 1968'de geliştirdiği iflas tahmin "
+        "modeli, 50 yıldır kullanılıyor. Formül: "
+        "<i>Z = 1.2·(İşletme Sermayesi/Aktif) + 1.4·(Birikmiş Kâr/Aktif) + "
+        "3.3·(EBIT/Aktif) + 0.6·(PD/Toplam Yük.) + 1.0·(Satış/Aktif)</i>. "
+        "Yorum: <b>Z &gt; 2.99 güvenli</b>, 1.81-2.99 gri bölge, "
+        "<b>Z &lt; 1.81 iflas risk bölgesi</b>.",
+        styles['Normal2']))
+    elems.append(Spacer(1, 3*mm))
+    elems.append(Paragraph(
+        "<b>Esas Faaliyet Kâr Kalitesi</b> = Faaliyet Kârı / Net Kâr. "
+        "1'e yakınsa net kâr tamamen esas faaliyetten geliyor (yüksek kalite). "
+        "0.5'in altındaysa net karın çoğu faaliyet dışı kalemlerden (kur farkı, "
+        "finansal yatırım kazancı, tek seferlik gelir) — Yaşar Erdinç'in özellikle "
+        "uyardığı tuzak.",
+        styles['Normal2']))
+
+    elems.append(Spacer(1, 4*mm))
+    elems.append(Paragraph("Reel Büyüme Hesabı", styles['SectionTitle']))
+    elems.append(Paragraph(
+        "Tüm büyüme metrikleri <b>TÜFE düzeltmeli reel bazda</b> hesaplanır: "
+        "<i>reel = ((1 + nominal/100) / (1 + TÜFE/100) - 1) × 100</i>. "
+        "Örnek: nominal %150 büyüme, TÜFE %32 → reel %89. "
+        "Bu, CANSLIM (William O'Neil) metodolojisinin C ve A unsurlarının "
+        "uygulanmasını sağlar — enflasyon arındırılmış kâr büyümesi.",
+        styles['Normal2']))
+
+    elems.append(Spacer(1, 4*mm))
+    elems.append(Paragraph("Otomatik Tetiklenen Kırmızı Bayraklar",
+                           styles['SectionTitle']))
+    elems.append(Paragraph(
+        "Skorlama ile bağımsız olarak çalışan otomatik uyarılar: "
+        "Net Marj &gt; FAVÖK Marjı (faaliyet dışı kâr), F/K negatif (zarar), "
+        "Cari Oran &lt; 1 (likidite riski), Faiz Karşılama &lt; 1.5 (kritik), "
+        "Yatırım/Holding ismi (NAV gereği), baz etkili büyüme (&gt;%300), "
+        "büyük negatif Net YPP (kur riski), yüksek volatilite, düşük fiili dolaşım, "
+        "Altman Z &lt; 1.81 (iflas riski), Piotroski ≤ 3 (düşük kalite), "
+        "Esas faaliyet kâr kalitesi &lt; 0.5.",
         styles['Normal2']))
 
     elems.append(Spacer(1, 8*mm))
