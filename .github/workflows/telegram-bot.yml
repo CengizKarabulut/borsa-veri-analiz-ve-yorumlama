@@ -1,10 +1,8 @@
 name: Telegram BIST Bot
 
 on:
-  # GitHub cron en sık 5 dakikada bir çalışır
   schedule:
     - cron: '*/5 * * * *'
-  # Manuel tetikleme — istersen bekleyen kuyruğu temizleyebilirsin
   workflow_dispatch:
     inputs:
       ack_all:
@@ -16,7 +14,6 @@ on:
           - 'false'
           - 'true'
 
-# Aynı anda birden fazla çalışma olmasını engelle
 concurrency:
   group: telegram-bist-bot
   cancel-in-progress: false
@@ -34,6 +31,9 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
+
+      - name: Ensure DejaVu fonts for PDF (Türkçe karakter desteği)
+        run: sudo apt-get install -y --no-install-recommends fonts-dejavu-core || true
 
       - name: Install dependencies
         run: pip install -r requirements.txt
